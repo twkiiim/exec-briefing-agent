@@ -3,11 +3,10 @@ import logging
 from dotenv import load_dotenv
 from google.adk.agents.llm_agent import Agent
 from google.adk.agents.sequential_agent import SequentialAgent
+from google.adk.tools import FunctionTool
 from .tools import (
     fetch_url_content,
-    investigation_tool_internal_logs,
-    investigation_tool_threat_intel,
-    investigation_tool_asset_db,
+
     create_mcp_toolset,
     search_web_for_iocs
 )
@@ -19,16 +18,13 @@ logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 load_dotenv()
 
 # Get MCP URLs from environment
-gti_mcp_url = os.getenv("GTI_MCP_URL", "https://stg-gti-mcp-ic427jowfa-uc.a.run.app/mcp")
-secops_mcp_url = os.getenv("SECOPS_MCP_URL", "https://stg-secops-mcp-ic427jowfa-uc.a.run.app/mcp")
+gti_mcp_server_url = os.getenv("GTI_MCP_URL")
+secops_mcp_server_url = os.getenv("SECOPS_MCP_URL")
 
-
-# 에이전트 정의
 
 # 1. Article Analyzer
-# fetch_url_content 도구를 사용하여 URL 내용을 가져옵니다.
 ioc_searcher = Agent(
-    model='gemini-2.5-flash',
+    model='gemini-3.1-flash-lite-preview',
     name="ioc_searcher",
     description="Searches for IOCs based on provided keywords.",
     instruction="""Use the `search_web_for_iocs` tool to search for more information about the security incident using the keywords provided in the input.
@@ -53,15 +49,38 @@ ioc_searcher = Agent(
     output_key="analysis_result"
 )
 
+async def search_iocs_via_agent(keywords: str) -> str:
+    """Searches for IOCs using the ioc_searcher agent.
+    
+    Args:
+        keywords: The keywords to search for.
+    Returns:
+        JSON string with IOCs.
+    """
+    print(f"[Tool: Agent Tool] Running ioc_searcher with keywords: {keywords}")
+    final_text = ""
+    try:
+        async for event in ioc_searcher.run_live(f"Keywords: {keywords}"):
+            if hasattr(event, 'name') and event.name == 'Output-Agent':
+                if hasattr(event, 'content') and 'parts' in event.content:
+                    for part in event.content['parts']:
+                        if 'text' in part:
+                            final_text += part['text']
+    except Exception as e:
+        print(f"Error in search_iocs_via_agent: {e}")
+        return f"Error running ioc_searcher: {e}"
+        
+    return final_text
+
 keyword_extractor = Agent(
-    model='gemini-2.5-flash',
+    model='gemini-3.1-flash-lite-preview',
     name="keyword_extractor",
     description="Extracts keywords and decides whether to search for IOCs.",
     instruction="""Use the `fetch_url_content` tool to read the content of the provided URL.
     Then, analyze the content to extract key keywords and a comprehensive summary of the security event.
     
     Decide if it is necessary to search for more IOCs on the web.
-    If YES, use the `ioc_searcher` tool to search for IOCs using the extracted keywords. The `ioc_searcher` will provide the final JSON result.
+    If YES, use the `search_iocs_via_agent` tool to search for IOCs using the extracted keywords. The `search_iocs_via_agent` will provide the final JSON result.
     If NO, you must generate the JSON result yourself with the following structure:
     {{
       "iocs": {{
@@ -74,50 +93,34 @@ keyword_extractor = Agent(
       "summary": "Summary from original page",
       "status": "SUCCESS"
     }}
-    Output ONLY the JSON object if you do not call ioc_searcher.""",
-    tools=[fetch_url_content, ioc_searcher],
+    Output ONLY the JSON object if you do not call search_iocs_via_agent.""",
+    tools=[fetch_url_content, FunctionTool(search_iocs_via_agent)],
     output_key="analysis_result"
 )
 
 # 2. Investigator
-# {analysis_result} 플레이스홀더를 사용하여 이전 에이전트의 출력을 참조합니다.
-investigator_tools = [
-    investigation_tool_internal_logs,
-    investigation_tool_threat_intel,
-    investigation_tool_asset_db
-]
-
-# Try to add MCP tools if URLs are available
-# try:
-#     logger.info(f"Adding GTI MCP tools from {gti_mcp_url}")
-#     investigator_tools.append(create_mcp_toolset(gti_mcp_url))
-# except Exception as e:
-#     logger.warning(f"Failed to add GTI MCP tools: {e}")
-
-# try:
-#     logger.info(f"Adding SecOps MCP tools from {secops_mcp_url}")
-#     investigator_tools.append(create_mcp_toolset(secops_mcp_url))
-# except Exception as e:
-#     logger.warning(f"Failed to add SecOps MCP tools: {e}")
-
+# Refer to the output of the previous agent using the {analysis_result} placeholder.
 investigator = Agent(
-    model='gemini-2.5-flash',
+    model='gemini-3.1-flash-lite-preview',
     name="investigator",
     description="Investigates security events using tools.",
     instruction="""Given the analysis result: {analysis_result}.
     The analysis result is a JSON string.
     If the "status" is "NO_IOCS_FOUND" or if there are no IOCs in all categories, do NOT use any tools. Simply output 'Workflow terminated: No IOCs found to investigate.'
-    Otherwise, for EACH IOC listed in the "iocs" object (across all categories), you MUST use the available tools to check if there is any related internal compromise data or threat intelligence.
-    You have access to internal logs, threat intel, and asset DB dummy tools, as well as real MCP tools for Google Threat Intelligence and SecOps if available.
+    Otherwise, for EACH IOC listed in the "iocs" object (across all categories), you MUST use the available MCP tools (Google Threat Intelligence and SecOps) to check for related threat intelligence or compromise data.
+    You MUST execute tool calls for every identified IOC. Do not just summarize without calling tools.
     Summarize the findings from all tools used for all IOCs.""",
-    tools=investigator_tools,
+    tools=[
+        create_mcp_toolset(gti_mcp_server_url),
+        create_mcp_toolset(secops_mcp_server_url)
+    ],
     output_key="investigation_result"
 )
 
 # 3. Consolidator
-# {investigation_result} 플레이스홀더를 사용하여 이전 에이전트의 출력을 참조합니다.
+# Refer to the output of the previous agent using the {investigation_result} placeholder.
 consolidator = Agent(
-    model='gemini-2.5-flash',
+    model='gemini-3.1-flash-lite-preview',
     name="consolidator",
     description="Consolidates findings and answers Yes/No.",
     instruction="""Given the investigation result: {investigation_result}.
@@ -130,16 +133,16 @@ consolidator = Agent(
     Answer Yes if any exposed assets or internal compromise was found, otherwise No.""",
 )
 
-# 순차 에이전트로 전체 흐름 묶기 (워크플로우로 변경)
+# Bind the full flow with a sequential agent (changed to workflow)
 hunting_workflow = SequentialAgent(
     name="hunting_workflow",
     description="Runs the full hunting workflow: extracts keywords and dynamically searches for IOCs, investigates findings, and consolidates results.",
     sub_agents=[keyword_extractor, investigator, consolidator]
 )
 
-# 새로운 root_agent (일반 Agent)
+# New root_agent (Regular Agent)
 root_agent = Agent(
-    model='gemini-2.5-flash',
+    model='gemini-3.1-flash-lite-preview',
     name="root_agent",
     description="Root agent that handles user requests and decides when to run the hunting workflow.",
     instruction="""You are the root agent.

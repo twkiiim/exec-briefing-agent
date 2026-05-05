@@ -5,20 +5,7 @@ from .utils import get_id_token
 
 logger = logging.getLogger(__name__)
 
-def investigation_tool_internal_logs(ioc: str) -> str:
-    """검색 로그에서 IOC 관련 내용을 조회합니다."""
-    print(f"[Tool: Internal Logs] Searching for {ioc}...")
-    return f"Internal Logs Finding for {ioc}: No exploitation attempts found."
 
-def investigation_tool_threat_intel(ioc: str) -> str:
-    """위협 인텔리전스 정보를 조회합니다."""
-    print(f"[Tool: Threat Intel] Searching for {ioc}...")
-    return f"Threat Intel Finding for {ioc}: Active exploitation seen by APT-X."
-
-def investigation_tool_asset_db(ioc: str) -> str:
-    """자산 DB에서 취약한 버전을 사용하는 자산을 조회합니다."""
-    print(f"[Tool: Asset DB] Searching for {ioc}...")
-    return f"Asset DB Finding for {ioc}: 5 exposed Apache servers found."
 
 def fetch_url_content(url: str) -> str:
     """Fetches the content of a given URL.
@@ -66,7 +53,10 @@ def create_mcp_toolset(url: str) -> McpToolset:
         params = StreamableHTTPConnectionParams(url=url)
     else:
         logger.info(f"Connecting to remote MCP server at {url}")
-        token = get_id_token(url)
+        from urllib.parse import urlparse
+        parsed_url = urlparse(url)
+        audience = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        token = get_id_token(audience)
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         params = StreamableHTTPConnectionParams(url=url, headers=headers)
         
