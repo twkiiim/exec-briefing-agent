@@ -7,6 +7,7 @@ from .tools import (
     fetch_url_content,
     create_mcp_toolset
 )
+from google.adk.tools.agent_tool import AgentTool
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
@@ -125,15 +126,52 @@ hunting_workflow = SequentialAgent(
     sub_agents=[keyword_extractor, ioc_collector, investigator, consolidator]
 )
 
-# New root_agent (Regular Agent)
+reporting_agent = Agent(
+    model='gemini-3.1-flash-lite-preview',
+    name="reporting_agent",
+    description="Generates the final Executive Threat Advisory report.",
+    instruction="""You are the reporting agent.
+    Your task is to generate a structured "EXECUTIVE THREAT ADVISORY" report based on the findings from the `hunting_workflow` tool.
+    You MUST invoke the `hunting_workflow` tool with the provided URL to get the investigation results.
+    Once you receive the results from `hunting_workflow`, you must map them into the following strict template and output ONLY this template. Do not output any other text before or after the template.
+    
+    Here is the exact structure you must follow:
+
+    🛡️ EXECUTIVE THREAT ADVISORY
+
+    Threat Profile: [Agent inserts threat name derived from article, e.g., "Volt Typhoon Infrastructure Target" or "Log4j Vulnerability"]
+
+    VERDICT: [Agent outputs a color-coded, clear status: e.g., 🟢 NO IMMEDIATE IMPACT | 🔴 CRITICAL IMPACT DETECTED | 🟡 ELEVATED RISK - VULNERABILITY PRESENT]
+
+    HIGH-LEVEL BUSINESS SUMMARY: [Agent provides a 2-3 sentence executive translation of the article. E.g., "The provided article details a newly discovered Zero-Day vulnerability affecting Microsoft SharePoint. If exploited, this allows unauthorized actors to access internal documents. Based on our rapid telemetry scan, our business operations are currently secure/compromised."]
+
+    REASONING & INVESTIGATION FINDINGS: [Agent details the 'Why' behind the verdict using internal data]
+    - (Scenario A - No Match): "I have scanned our Google SecOps environment across the last 30 days. There are no instances of the vulnerable software version running in our production environment, and zero network traffic matches for the 15 malicious IP addresses associated with this campaign."
+    - (Scenario B - Match): "I queried our Google SecOps Asset Inventory and found 3 production servers running the affected software. Furthermore, telemetry from the last 24 hours confirms 5 inbound communication attempts from known malicious IPs associated with this threat actor."
+
+    ACTION PLAN (PROACTIVE & REACTIVE STEPS): [Agent provides prescriptive guidance based on the verdict]
+    - (Scenario A - Proactive): "To enhance our defensive posture, I have drafted a ticket to proactively add the newly discovered IOCs from this article into our Google SecOps blocklists. I recommend scheduling a routine scan for any dormant instances of this software."
+    - (Scenario B - Reactive): "Immediate containment is required. I have surfaced the relevant SOAR playbooks to instantly isolate the 3 affected servers from the public internet. The SOC Tier 3 team has been automatically paged via Jira (Ticket #1042) to begin patching."
+
+    FURTHER TECHNICAL DETAILS: [Agent provides a collapsible section for security leaders/analysts to drill down]
+    - Source Reference: [URL analyzed]
+    - Threat Actor Context (via GTI): [Information on the adversary's motives/history]
+    - Analyzed IOCs: [List of IP addresses, hashes, and domains checked]
+    - Internal SecOps Matches: [List of specific internal hostnames, user IDs, or log IDs affected - Or "N/A"]
+    
+    ## RULE ##
+    You must ONLY output the completed template above. Do not add any conversational filler or extra text.""",
+    tools=[AgentTool(agent=hunting_workflow)]
+)
+
 root_agent = Agent(
     model='gemini-3.1-flash-lite-preview',
     name="root_agent",
     description="Root agent that handles user requests and decides when to run the hunting workflow.",
     instruction="""You are the root agent.
     Your task is to handle user requests.
-    If the user provides a page URL for a security incident or vulnerability, you MUST transfer control to the `hunting_workflow` sub-agent to process it.
-    Do not attempt to analyze the URL yourself or use other tools. Just pass the URL to `hunting_workflow`.
+    If the user provides a page URL for a security incident or vulnerability, you MUST transfer control to the `reporting_agent` sub-agent to process it.
+    Do not attempt to analyze the URL yourself or use other tools. Just pass the URL to `reporting_agent`.
     If the user does not provide a URL or asks about other things, respond politely stating that you need a URL to start the investigation.""",
-    sub_agents=[hunting_workflow]
+    sub_agents=[reporting_agent]
 )
