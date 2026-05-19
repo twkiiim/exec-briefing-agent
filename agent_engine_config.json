@@ -1,5 +1,5 @@
 {
-    "display_name": "Exec Briefing Agent",
+    "display_name": "hunting_agent",
     "staging_bucket": "agent-engine-deployment-taewoo",
     "service_account": "gti-agent-sa@ge-for-agentic-security.iam.gserviceaccount.com",
     "env_vars": {

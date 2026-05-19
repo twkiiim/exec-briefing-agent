@@ -3,12 +3,9 @@ import logging
 from dotenv import load_dotenv
 from google.adk.agents.llm_agent import Agent
 from google.adk.agents.sequential_agent import SequentialAgent
-from google.adk.tools import FunctionTool
 from .tools import (
     fetch_url_content,
-
-    create_mcp_toolset,
-    search_web_for_iocs
+    create_mcp_toolset
 )
 
 logger = logging.getLogger(__name__)
@@ -22,16 +19,36 @@ gti_mcp_server_url = os.getenv("GTI_MCP_URL")
 secops_mcp_server_url = os.getenv("SECOPS_MCP_URL")
 
 
-# 1. Article Analyzer
-ioc_searcher = Agent(
+# 1. Keyword Extractor
+keyword_extractor = Agent(
     model='gemini-3.1-flash-lite-preview',
-    name="ioc_searcher",
-    description="Searches for IOCs based on provided keywords.",
-    instruction="""Use the `search_web_for_iocs` tool to search for more information about the security incident using the keywords provided in the input.
-    Look for articles or blog posts that might contain specific Indicators of Compromise (IOCs) like IPs, domains, hashes, or URLs.
-    You MUST verify that the searched pages are talking about the EXACT SAME incident and are temporally connected (same time frame).
+    name="keyword_extractor",
+    description="Extracts keywords from URL content.",
+    instruction="""Use the `fetch_url_content` tool to read the content of the provided URL.
+    Then, analyze the content to extract key keywords and a comprehensive summary of the security event.
+    Output the keywords and summary.
     
-    Then, extract the IOCs in the following JSON structure:
+    ## RULE ##
+    At the end of your response, you must accurately list ONLY the tools you specifically invoked to answer the CURRENT query in this turn.
+    For each tool used, you must specify:
+    1. The name of the tool.
+    2. The arguments used for the call.
+    3. The source or MCP server it belongs to (e.g., 'Local Function').
+    If you did not use any tools for this specific response, you must clearly state that you did not use any tools.""",
+    tools=[fetch_url_content],
+    output_key="keyword_extraction_result"
+)
+
+# 1.5 IOC Collector
+ioc_collector = Agent(
+    model='gemini-3.1-flash-lite-preview',
+    name="ioc_collector",
+    description="Searches GTI for IOCs using keywords.",
+    instruction="""Given the keyword extraction result from the previous step: {keyword_extraction_result}.
+    Use the extracted keywords to search for related Indicators of Compromise (IOCs) in the Google Threat Intelligence platform using the `search_iocs` tool.
+    Extract domains, IPs, URLs, and hashes found in the search results.
+    
+    Output the findings in the following JSON structure:
     {{
       "iocs": {{
         "ip": [...],
@@ -40,78 +57,46 @@ ioc_searcher = Agent(
         "url": [...],
         "other_identifiers": [...]
       }},
-      "summary": "Combined summary including new findings",
+      "summary": "Summary of the security event",
       "status": "SUCCESS"
     }}
-    If no IOCs are found, set the "iocs" object to empty lists and set "status" to "NO_IOCS_FOUND".
-    Output ONLY the JSON object.""",
-    tools=[search_web_for_iocs],
+    If no IOCs are found in GTI, set the "iocs" object to empty lists and set "status" to "NO_IOCS_FOUND".
+    Output ONLY the JSON object.
+    
+    ## RULE ##
+    At the end of your response, you must accurately list ONLY the tools you specifically invoked to answer the CURRENT query in this turn.
+    For each tool used, you must specify:
+    1. The name of the tool.
+    2. The arguments used for the call.
+    3. The source or MCP server it belongs to (e.g., 'GTI MCP').
+    If you did not use any tools for this specific response, you must clearly state that you did not use any tools.""",
+    tools=[create_mcp_toolset(gti_mcp_server_url)],
     output_key="analysis_result"
 )
 
-async def search_iocs_via_agent(keywords: str) -> str:
-    """Searches for IOCs using the ioc_searcher agent.
-    
-    Args:
-        keywords: The keywords to search for.
-    Returns:
-        JSON string with IOCs.
-    """
-    print(f"[Tool: Agent Tool] Running ioc_searcher with keywords: {keywords}")
-    final_text = ""
-    try:
-        async for event in ioc_searcher.run_live(f"Keywords: {keywords}"):
-            if hasattr(event, 'name') and event.name == 'Output-Agent':
-                if hasattr(event, 'content') and 'parts' in event.content:
-                    for part in event.content['parts']:
-                        if 'text' in part:
-                            final_text += part['text']
-    except Exception as e:
-        print(f"Error in search_iocs_via_agent: {e}")
-        return f"Error running ioc_searcher: {e}"
-        
-    return final_text
-
-keyword_extractor = Agent(
-    model='gemini-3.1-flash-lite-preview',
-    name="keyword_extractor",
-    description="Extracts keywords and decides whether to search for IOCs.",
-    instruction="""Use the `fetch_url_content` tool to read the content of the provided URL.
-    Then, analyze the content to extract key keywords and a comprehensive summary of the security event.
-    
-    Decide if it is necessary to search for more IOCs on the web.
-    If YES, use the `search_iocs_via_agent` tool to search for IOCs using the extracted keywords. The `search_iocs_via_agent` will provide the final JSON result.
-    If NO, you must generate the JSON result yourself with the following structure:
-    {{
-      "iocs": {{
-        "ip": [],
-        "domain": [],
-        "hash": [],
-        "url": [],
-        "other_identifiers": []
-      }},
-      "summary": "Summary from original page",
-      "status": "SUCCESS"
-    }}
-    Output ONLY the JSON object if you do not call search_iocs_via_agent.""",
-    tools=[fetch_url_content, FunctionTool(search_iocs_via_agent)],
-    output_key="analysis_result"
-)
-
-# 2. Investigator
+# 2. Investigator (SecOps only)
 # Refer to the output of the previous agent using the {analysis_result} placeholder.
 investigator = Agent(
     model='gemini-3.1-flash-lite-preview',
     name="investigator",
-    description="Investigates security events using tools.",
+    description="Investigates security events using SecOps tools.",
     instruction="""Given the analysis result: {analysis_result}.
-    The analysis result is a JSON string.
+    The analysis result contains a JSON string with extracted IOCs.
     If the "status" is "NO_IOCS_FOUND" or if there are no IOCs in all categories, do NOT use any tools. Simply output 'Workflow terminated: No IOCs found to investigate.'
-    Otherwise, for EACH IOC listed in the "iocs" object (across all categories), you MUST use the available MCP tools (Google Threat Intelligence and SecOps) to check for related threat intelligence or compromise data.
+    Otherwise, for EACH IOC listed in the "iocs" object (across all categories), you MUST use the available Google SecOps MCP tools to check for related security events, alerts, or logs in your environment.
     You MUST execute tool calls for every identified IOC. Do not just summarize without calling tools.
-    Summarize the findings from all tools used for all IOCs.""",
+    Summarize the findings from SecOps for all IOCs.
+    
+    ## RULE ##
+    At the end of your response, you must accurately list ONLY the tools you specifically invoked to answer the CURRENT query in this turn.
+    For each tool used, you must specify:
+    1. The name of the tool.
+    2. The arguments used for the call.
+    3. The source or MCP server it belongs to (e.g., 'SecOps MCP').
+    If a tool name is generic like 'default_api.search', make sure to identify its source server correctly based on the context or the toolset it belongs to.
+    Do not list tools used in previous turns or tools that you did not actually call for this specific response.
+    If you did not use any tools for this specific response, you must clearly state that you did not use any tools.""",
     tools=[
-        create_mcp_toolset(gti_mcp_server_url),
         create_mcp_toolset(secops_mcp_server_url)
     ],
     output_key="investigation_result"
@@ -136,8 +121,8 @@ consolidator = Agent(
 # Bind the full flow with a sequential agent (changed to workflow)
 hunting_workflow = SequentialAgent(
     name="hunting_workflow",
-    description="Runs the full hunting workflow: extracts keywords and dynamically searches for IOCs, investigates findings, and consolidates results.",
-    sub_agents=[keyword_extractor, investigator, consolidator]
+    description="Runs the full hunting workflow: extracts keywords, searches GTI for IOCs, investigates findings, and consolidates results.",
+    sub_agents=[keyword_extractor, ioc_collector, investigator, consolidator]
 )
 
 # New root_agent (Regular Agent)
@@ -152,4 +137,3 @@ root_agent = Agent(
     If the user does not provide a URL or asks about other things, respond politely stating that you need a URL to start the investigation.""",
     sub_agents=[hunting_workflow]
 )
-
